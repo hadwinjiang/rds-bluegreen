@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # 蓝绿升级 —— 执行切换
 #
-# 用法: ./04-switchover.sh <instance-id> [--apply] [--timeout 300] [--force]
+# 用法: ./03-switchover.sh <instance-id> [--apply] [--timeout 300] [--force]
 #
-# 这个脚本刻意做得「哑」：先调 03-gate.sh，闸门不过就退出；过了就一条命令切换。
+# 这个脚本刻意做得「哑」：先调 02-gate.sh，闸门不过就退出；过了就一条命令切换。
 # 不做任何判断、不做任何重试、不在循环里等人决策。
 # 切换窗口只有 10 秒量级（实测三组 9.8~10.5 秒），这里的复杂度就是风险。
 #
@@ -26,13 +26,13 @@ while [ $# -gt 0 ]; do
 done
 
 BG_ID=$(state_get "${INST}" BG_ID)
-[ -n "${BG_ID}" ] || die "状态文件里没有 BG_ID，请先跑 02-create-bluegreen.sh"
+[ -n "${BG_ID}" ] || die "状态文件里没有 BG_ID，请先跑 01-prepare.sh --apply"
 
 step "切换前闸门复查"
 if [ "${FORCE}" = "true" ]; then
   warn "--force：跳过闸门检查（生产环境不应使用）"
 else
-  if ! ./03-gate.sh "${INST}" "${LAGCHECK_FLAG:-}"; then
+  if ! ./02-gate.sh "${INST}"; then
     die "闸门未通过，拒绝切换。请修复后重试。"
   fi
 fi
@@ -48,7 +48,7 @@ log "  green    : ${GREEN_ID} (${TARGET})"
 log "  超时      : ${TIMEOUT}s"
 log ""
 log "  切换后端点改名：green → ${INST}，旧 blue → ${INST}-old1"
-log "  应用无需改连接串，但必须已收紧 JVM DNS 缓存 TTL（见 00-preflight-app.sh）"
+log "  应用无需改连接串，但必须已收紧 JVM DNS 缓存 TTL（networkaddress.cache.ttl，建议 ≤5s）"
 log ""
 log "  预期：AWS 报告写停机 ~1 秒；应用实测停机 7~14 秒（差值为 DNS 传播 + 连接池重建）"
 
@@ -68,7 +68,7 @@ OUT=$(aws rds switchover-blue-green-deployment \
         --switchover-timeout "${TIMEOUT}" \
         --query 'BlueGreenDeployment.Status' --output text 2>&1) || {
   log "${OUT}"
-  die "切换下发失败。若报 InvalidBlueGreenDeploymentStateFault，说明 green 实例尚未 available —— 重跑 03-gate.sh 确认。"
+  die "切换下发失败。若报 InvalidBlueGreenDeploymentStateFault，说明 green 实例尚未 available —— 重跑 02-gate.sh 确认。"
 }
 ok "已下发，状态=${OUT}"
 
@@ -81,7 +81,7 @@ while :; do
   printf '  %s  status=%s  (%ds)\n' "$(date -u '+%H:%M:%S')" "${ST}" "$((NOW-T0))"
   case "${ST}" in
     SWITCHOVER_COMPLETED)
-      ok "切换完成，耗时 $((NOW-T0))s（含闸门与轮询开销）"
+      ok "切换完成，耗时 $((NOW-T0))s（含控制面状态滞后与轮询开销，非业务停机）"
       state_set "${INST}" SWITCHED_AT "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
       break ;;
     SWITCHOVER_FAILED)
@@ -100,6 +100,33 @@ step "切换后的 RDS 事件（AWS 口径停机）"
 aws rds describe-events --source-identifier "${INST}" --source-type db-instance --duration 10 \
   --query 'Events[].[Date,Message]' --output text 2>/dev/null | grep -iE 'switchover|downtime' || true
 
+# ---------- 切换后自查清单 ----------
+# 刻意只给「怎么查」和「什么情况该回滚」，不自动判定 ——
+# 判定需要应用侧埋点与业务上下文，脚本拿不到，硬编码阈值只会误报。
+step "切换后请人工确认"
+OLD="${INST}-old1"
+EP=$(rds_q "${INST}" Endpoint.Address)
+OLD_EP=$(rds_q "${OLD}" Endpoint.Address 2>/dev/null)
+
+log "  ① 端点已指向新实例（DNS 是否传播完）"
+log "     mysql -h ${EP} -u <user> -p -e 'SELECT VERSION();'"
+log "     期望 ${TARGET:-<目标版本>}；若仍是旧版本，说明客户端 DNS 缓存未过期"
 log ""
-info "下一步（立刻执行，用于验证与回滚判定）：./05-verify.sh ${INST}"
-info "确认稳定后再执行：./06-cleanup-old.sh ${INST}   ← ${INST}-old1 是唯一回滚资产，且持续计费"
+log "  ② 应用错误率是否回落到基线"
+log "     看监控里 5xx 曲线。蓝绿本身会有 7~14 秒 503，关键是「现在还在错吗」"
+log "     出现 500（而非 503）= 真缺陷，按错误契约应立即回滚"
+log ""
+log "  ③ 写入确实恢复了（零错误也可能是零流量）"
+log ""
+log "  回滚资产：${OLD}（$(rds_q "${OLD}" EngineVersion 2>/dev/null || echo '?')，状态 $(rds_q "${OLD}" DBInstanceStatus 2>/dev/null || echo '?')）"
+log ""
+step "需要回滚时"
+log "  蓝绿切换后不能用 switchover 回切，只能手工把流量指回 old1："
+log "    1. 最快：把应用连接串指向 ${OLD} 的端点"
+log "       ${OLD_EP:-<old1 端点>}"
+log "    2. 或：重命名实例（会有一次停机）"
+log "       aws rds modify-db-instance --db-instance-identifier ${INST} --new-db-instance-identifier ${INST}-bad --apply-immediately"
+log "       aws rds modify-db-instance --db-instance-identifier ${OLD} --new-db-instance-identifier ${INST} --apply-immediately"
+log ""
+info "确认稳定（建议 ≥1 小时）后执行：./04-cleanup-old.sh ${INST}"
+info "  ← ${OLD} 是唯一回滚资产，且持续计费：既不能忘记删，也不能太早删"

@@ -100,6 +100,20 @@ mutate() {  # mutate <描述> <命令...>
   fi
 }
 
+# 同 mutate，但真正执行时丢弃命令 stdout（dry-run 的提示仍会打印）。
+# 不要写成 `mutate ... >/dev/null` —— 那会把 DRY-RUN 提示一起吞掉。
+mutate_quiet() {  # mutate_quiet <描述> <命令...>
+  local desc="$1"; shift
+  if [ "${APPLY}" = "true" ]; then
+    info "执行：${desc}"
+    "$@" >/dev/null
+  else
+    printf '  %sDRY-RUN%s 将执行：%s\n' "${_c_yel}" "${_c_off}" "${desc}"
+    printf '          %s\n' "$*"
+    return 0
+  fi
+}
+
 parse_apply_flag() {  # 从参数里摘出 --apply
   for a in "$@"; do [ "${a}" = "--apply" ] && APPLY=true; done
   export APPLY

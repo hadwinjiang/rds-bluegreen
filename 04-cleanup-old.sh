@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 蓝绿升级 —— 清理旧 blue（-old1）与蓝绿部署记录
 #
-# 用法: ./06-cleanup-old.sh <instance-id> [--apply]
+# 用法: ./04-cleanup-old.sh <instance-id> [--apply]
 #
 # ⚠️ 这一步刻意不进流水线、刻意要求交互确认。
 #    ${INST}-old1 是切换后【唯一】的回滚资产 —— 删早了就没有退路，
