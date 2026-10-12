@@ -43,7 +43,7 @@ watch -n 60 "./02-gate.sh $INST"
 | `_common.sh` | — | 公共库：日志、状态文件、dry-run 包装 |
 | `01-prepare.sh` | **写** | 9 项预检 + 创建蓝绿。预检 NO-GO 则拒绝创建。`--target-class` / `--target-pg` / `--auto-target-pg` 可选 |
 | `02-gate.sh` | 只读 | 七项切换闸门 |
-| `03-switchover.sh` | **写** | 先调 `02`，不过则拒绝；超时被取消会当失败处理。切换后打印自查清单与回滚步骤 |
+| `03-switchover.sh` | **写** | 先调 `02`，不过则拒绝；超时被取消会当失败处理。切换成功后重启旧 blue（`-old1`）断开残留连接，再打印自查清单与回滚步骤 |
 | `04-cleanup-old.sh` | **写** | 删除 `-old1` 与蓝绿记录 |
 
 ### `01-prepare.sh` 的 9 项预检

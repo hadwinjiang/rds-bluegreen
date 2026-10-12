@@ -1,26 +1,33 @@
 #!/usr/bin/env bash
 # 蓝绿升级 —— 执行切换
 #
-# 用法: ./03-switchover.sh <instance-id> [--apply] [--timeout 300] [--force]
+# 用法: ./03-switchover.sh <instance-id> [--apply] [--timeout 300] [--force] [--skip-restart-old]
 #
 # 这个脚本刻意做得「哑」：先调 02-gate.sh，闸门不过就退出；过了就一条命令切换。
 # 不做任何判断、不做任何重试、不在循环里等人决策。
 # 切换窗口只有 10 秒量级（实测三组 9.8~10.5 秒），这里的复杂度就是风险。
 #
 # --force 跳过闸门（仅用于演练/排障，生产不要用）
+#
+# --skip-restart-old 切换后不重启旧 blue（默认会重启）
+# 为什么默认要重启旧 blue：切换后旧实例被改名成 <inst>-old1，但仍然 available，
+# 仍然接受连接。DNS 缓存未过期的客户端会继续连在旧实例上读写 —— 写到那里的数据
+# 不会回到新实例，是静默的数据分叉。重启旧实例会强制断开这些残留连接，
+# 迫使应用重新解析 DNS 并连到新实例。旧实例重启后仍然可用，回滚资产不受影响。
 
 cd "$(dirname "$0")"
 . ./_common.sh
 parse_apply_flag "$@"
 
 INST="${1:-}"
-[ -n "${INST}" ] || die "用法: $0 <instance-id> [--apply] [--timeout 300] [--force]"
+[ -n "${INST}" ] || die "用法: $0 <instance-id> [--apply] [--timeout 300] [--force] [--skip-restart-old]"
 
-TIMEOUT=300; FORCE=false
+TIMEOUT=300; FORCE=false; RESTART_OLD=true
 while [ $# -gt 0 ]; do
   case "$1" in
-    --timeout) TIMEOUT="${2:-300}"; shift 2 ;;
-    --force)   FORCE=true; shift ;;
+    --timeout)          TIMEOUT="${2:-300}"; shift 2 ;;
+    --force)            FORCE=true; shift ;;
+    --skip-restart-old) RESTART_OLD=false; shift ;;
     *) shift ;;
   esac
 done
@@ -56,6 +63,11 @@ if [ "${APPLY}" != "true" ]; then
   printf '\n  %sDRY-RUN%s 将执行：\n' "${_c_yel}" "${_c_off}"
   log "    aws rds switchover-blue-green-deployment \\"
   log "      --blue-green-deployment-identifier ${BG_ID} --switchover-timeout ${TIMEOUT}"
+  if [ "${RESTART_OLD}" = "true" ]; then
+    log "    aws rds reboot-db-instance --db-instance-identifier ${INST}-old1   # 断开残留连接"
+  else
+    log "    （--skip-restart-old：切换后不重启旧 blue）"
+  fi
   log ""
   log "  确认后加 --apply 真正切换。"
   exit 0
@@ -100,11 +112,52 @@ step "切换后的 RDS 事件（AWS 口径停机）"
 aws rds describe-events --source-identifier "${INST}" --source-type db-instance --duration 10 \
   --query 'Events[].[Date,Message]' --output text 2>/dev/null | grep -iE 'switchover|downtime' || true
 
+OLD="${INST}-old1"
+
+# ---------- 重启旧 blue，逼应用重连 ----------
+# 放在自查清单之前：先切断残留连接，再让人去看监控，否则看到的指标里混着旧实例的流量。
+step "重启旧 blue（${OLD}）"
+if [ "${RESTART_OLD}" != "true" ]; then
+  warn "--skip-restart-old：跳过。DNS 缓存未过期的客户端可能仍在旧实例上读写（数据分叉风险）"
+else
+  OLD_ST=$(rds_q "${OLD}" DBInstanceStatus)
+  if [ -z "${OLD_ST}" ] || [ "${OLD_ST}" = "None" ]; then
+    warn "找不到实例 ${OLD}，跳过重启。请人工确认旧 blue 的实际名字"
+  elif [ "${OLD_ST}" != "available" ]; then
+    warn "${OLD} 当前状态 ${OLD_ST}（非 available），跳过重启以免叠加操作。可稍后手工执行："
+    log "     aws rds reboot-db-instance --db-instance-identifier ${OLD}"
+  else
+    OUT=$(aws rds reboot-db-instance --db-instance-identifier "${OLD}" \
+            --query 'DBInstance.DBInstanceStatus' --output text 2>&1) || {
+      log "${OUT}"
+      warn "重启下发失败。残留连接可能还在旧实例上，请人工重启：aws rds reboot-db-instance --db-instance-identifier ${OLD}"
+      OUT=""
+    }
+    if [ -n "${OUT}" ]; then
+      ok "已下发重启，状态=${OUT}"
+      R0=$(date -u +%s)
+      # 只等回到 available，不做失败判定 —— 旧实例已不在服务路径上，
+      # 它起不来只影响回滚能力，不影响当前业务，交给人判断。
+      while :; do
+        OLD_ST=$(rds_q "${OLD}" DBInstanceStatus)
+        NOW=$(date -u +%s)
+        printf '  %s  %s=%s  (%ds)\n' "$(date -u '+%H:%M:%S')" "${OLD}" "${OLD_ST}" "$((NOW-R0))"
+        [ "${OLD_ST}" = "available" ] && [ $((NOW-R0)) -gt 20 ] && { ok "${OLD} 已回到 available，回滚资产完好"; break; }
+        if [ $((NOW-R0)) -gt 600 ]; then
+          warn "${OLD} 600s 内未回到 available（当前 ${OLD_ST}）。不影响当前业务，但回滚能力待确认"
+          break
+        fi
+        sleep 10
+      done
+      state_set "${INST}" OLD_REBOOTED_AT "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    fi
+  fi
+fi
+
 # ---------- 切换后自查清单 ----------
 # 刻意只给「怎么查」和「什么情况该回滚」，不自动判定 ——
 # 判定需要应用侧埋点与业务上下文，脚本拿不到，硬编码阈值只会误报。
 step "切换后请人工确认"
-OLD="${INST}-old1"
 EP=$(rds_q "${INST}" Endpoint.Address)
 OLD_EP=$(rds_q "${OLD}" Endpoint.Address 2>/dev/null)
 

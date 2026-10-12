@@ -23,9 +23,11 @@ step "清理：${OLD}"
 show_identity
 
 OST=$(rds_q "${OLD}" DBInstanceStatus)
+ODP=false
 if [ -z "${OST:-}" ] || [ "${OST}" = "None" ]; then
   ok "${OLD} 不存在，无需清理"
 else
+  [ "$(rds_q "${OLD}" DeletionProtection)" = "True" ] && ODP=true
   OVER=$(rds_q "${OLD}" EngineVersion)
   OCLS=$(rds_q "${OLD}" DBInstanceClass)
   OALLOC=$(rds_q "${OLD}" AllocatedStorage)
@@ -33,6 +35,7 @@ else
   log "  版本   : ${OVER}（切换前的旧版本）"
   log "  规格   : ${OCLS} / ${OALLOC}GB"
   log "  状态   : ${OST}"
+  log "  删除保护: ${ODP}"
   [ -n "${SWITCHED}" ] && log "  切换于 : ${SWITCHED}"
 fi
 
@@ -45,6 +48,31 @@ else blocker "${INST} 状态为 ${NST} —— 新实例不健康，绝对不要�
 
 if [ "${FINDINGS_BLOCKER}" -gt 0 ]; then
   summary; exit 1
+fi
+
+# 删除保护打开时：脚本不代劳关闭。关闭保护属于「摘掉安全锁」，
+# 必须由人显式做一次，否则这层保护就等于不存在。
+if [ "${ODP}" = "true" ]; then
+  step "${OLD} 开启了删除保护 —— 脚本不会代为关闭"
+  warn "请自行执行下面两条命令（确认业务已稳定、不再需要回滚之后）："
+  log ""
+  log "  # 1) 关闭删除保护"
+  log "  aws rds modify-db-instance --db-instance-identifier ${OLD} \\"
+  log "    --no-deletion-protection --apply-immediately --region ${AWS_DEFAULT_REGION}"
+  log ""
+  log "  # 2) 删除实例"
+  log "  aws rds delete-db-instance --db-instance-identifier ${OLD} \\"
+  log "    --skip-final-snapshot --delete-automated-backups --region ${AWS_DEFAULT_REGION}"
+  if [ -n "${BG_ID}" ]; then
+    log ""
+    log "  # 3) 删除蓝绿部署记录（不影响实例）"
+    log "  aws rds delete-blue-green-deployment --blue-green-deployment-identifier ${BG_ID} \\"
+    log "    --region ${AWS_DEFAULT_REGION}"
+  fi
+  log ""
+  info "第 1 条执行后 modify 需要几十秒生效，立刻 delete 可能仍报 deletion protection，稍等重试即可。"
+  info "关闭保护后可重跑本脚本：./04-cleanup-old.sh ${INST} --apply"
+  exit 0
 fi
 
 log ""
