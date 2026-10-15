@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 蓝绿升级 —— 执行切换
 #
-# 用法: ./03-switchover.sh <instance-id> [--apply] [--timeout 300] [--force] [--skip-restart-old]
+# 用法: ./03-switchover.sh <instance-id> [--apply] [--timeout 300] [--force] [--skip-restart-old] [--reboot-gap 60]
 #
 # 这个脚本刻意做得「哑」：先调 02-gate.sh，闸门不过就退出；过了就一条命令切换。
 # 不做任何判断、不做任何重试、不在循环里等人决策。
@@ -14,18 +14,28 @@
 # 仍然接受连接。DNS 缓存未过期的客户端会继续连在旧实例上读写 —— 写到那里的数据
 # 不会回到新实例，是静默的数据分叉。重启旧实例会强制断开这些残留连接，
 # 迫使应用重新解析 DNS 并连到新实例。旧实例重启后仍然可用，回滚资产不受影响。
+#
+# 为什么重启两次（--reboot-gap 控制间隔，默认 60s）：
+# 一次重启只断开当下的连接。重连逻辑健壮、且 DNS 缓存还没过期的客户端会立刻连回旧实例，
+# 继续往那里写 —— 数据分叉的窗口没关掉。隔一分钟再重启一次，这些「反复连回来的」
+# 客户端会被第二次掐断，而此时 DNS TTL（建议 ≤5s）早已过期，重新解析就会落到新实例。
+#
+# 为什么不用 stop：stop 能彻底断掉连接，但实测从下发到 stopped 需要 ~574s（9.5 分钟，
+# 主要耗在最终快照），而且 rebooting 期间下发会被拒绝 —— 太慢，不适合放在切换窗口里。
+# 旧实例的计费与回收交给 04-cleanup-old.sh。
 
 cd "$(dirname "$0")"
 . ./_common.sh
 parse_apply_flag "$@"
 
 INST="${1:-}"
-[ -n "${INST}" ] || die "用法: $0 <instance-id> [--apply] [--timeout 300] [--force] [--skip-restart-old]"
+[ -n "${INST}" ] || die "用法: $0 <instance-id> [--apply] [--timeout 300] [--force] [--skip-restart-old] [--reboot-gap 60]"
 
-TIMEOUT=300; FORCE=false; RESTART_OLD=true
+TIMEOUT=300; FORCE=false; RESTART_OLD=true; REBOOT_GAP=60
 while [ $# -gt 0 ]; do
   case "$1" in
     --timeout)          TIMEOUT="${2:-300}"; shift 2 ;;
+    --reboot-gap)       REBOOT_GAP="${2:-60}"; shift 2 ;;
     --force)            FORCE=true; shift ;;
     --skip-restart-old) RESTART_OLD=false; shift ;;
     *) shift ;;
@@ -64,7 +74,9 @@ if [ "${APPLY}" != "true" ]; then
   log "    aws rds switchover-blue-green-deployment \\"
   log "      --blue-green-deployment-identifier ${BG_ID} --switchover-timeout ${TIMEOUT}"
   if [ "${RESTART_OLD}" = "true" ]; then
-    log "    aws rds reboot-db-instance --db-instance-identifier ${INST}-old1   # 断开残留连接"
+    log "    aws rds reboot-db-instance --db-instance-identifier ${INST}-old1   # 第 1 次：断开残留连接"
+    log "    sleep ${REBOOT_GAP}"
+    log "    aws rds reboot-db-instance --db-instance-identifier ${INST}-old1   # 第 2 次：掐断又连回来的客户端"
   else
     log "    （--skip-restart-old：切换后不重启旧 blue）"
   fi
@@ -114,44 +126,80 @@ aws rds describe-events --source-identifier "${INST}" --source-type db-instance 
 
 OLD="${INST}-old1"
 
-# ---------- 重启旧 blue，逼应用重连 ----------
+# ---------- 重启旧 blue 两次，逼应用重连 ----------
 # 放在自查清单之前：先切断残留连接，再让人去看监控，否则看到的指标里混着旧实例的流量。
-step "重启旧 blue（${OLD}）"
+#
+# 两次重启、间隔 ${REBOOT_GAP}s：第一次断开切换瞬间还连在旧实例上的连接；
+# 第二次掐断那些「断了又立刻连回来」的客户端 —— 此时 DNS TTL 已过期，重连会落到新实例。
+#
+# 实测（db.t3.large / Multi-AZ）：reboot 下发到回到 available ~153s，
+# 重启本体只有 ~11s，其余是 PI、参数组等收尾动作。所以第二次重启通常要等第一次收尾完。
+reboot_old() {  # reboot_old <第几次>
+  local n="$1" out r0 now st
+  st=$(rds_q "${OLD}" DBInstanceStatus)
+  if [ -z "${st}" ] || [ "${st}" = "None" ]; then
+    warn "找不到实例 ${OLD}，跳过第 ${n} 次重启。请人工确认旧 blue 的实际名字"
+    return 1
+  fi
+  # rebooting 期间下发会被拒绝 —— 先等回 available 再下发，而不是硬撞一次
+  if [ "${st}" != "available" ]; then
+    info "${OLD} 当前 ${st}，等它回到 available 再下发第 ${n} 次重启"
+    r0=$(date -u +%s)
+    while [ "${st}" != "available" ]; do
+      now=$(date -u +%s)
+      if [ $((now-r0)) -gt 600 ]; then
+        warn "${OLD} 600s 内未回到 available（当前 ${st}），放弃第 ${n} 次重启。可稍后手工执行："
+        log "     aws rds reboot-db-instance --db-instance-identifier ${OLD}"
+        return 1
+      fi
+      sleep 10
+      st=$(rds_q "${OLD}" DBInstanceStatus)
+      printf '  %s  %s=%s  (%ds)\n' "$(date -u '+%H:%M:%S')" "${OLD}" "${st}" "$((now-r0))"
+    done
+  fi
+  out=$(aws rds reboot-db-instance --db-instance-identifier "${OLD}" \
+          --query 'DBInstance.DBInstanceStatus' --output text 2>&1) || {
+    log "${out}"
+    warn "第 ${n} 次重启下发失败。残留连接可能还在旧实例上，请人工重启：aws rds reboot-db-instance --db-instance-identifier ${OLD}"
+    return 1
+  }
+  ok "第 ${n} 次重启已下发，状态=${out}"
+  state_set "${INST}" "OLD_REBOOT${n}_AT" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  return 0
+}
+
+wait_old_available() {
+  local r0 now st
+  r0=$(date -u +%s)
+  # 只等回到 available，不做失败判定 —— 旧实例已不在服务路径上，
+  # 它起不来只影响回滚能力，不影响当前业务，交给人判断。
+  while :; do
+    st=$(rds_q "${OLD}" DBInstanceStatus)
+    now=$(date -u +%s)
+    printf '  %s  %s=%s  (%ds)\n' "$(date -u '+%H:%M:%S')" "${OLD}" "${st}" "$((now-r0))"
+    [ "${st}" = "available" ] && [ $((now-r0)) -gt 20 ] && { ok "${OLD} 已回到 available，回滚资产完好"; return 0; }
+    if [ $((now-r0)) -gt 600 ]; then
+      warn "${OLD} 600s 内未回到 available（当前 ${st}）。不影响当前业务，但回滚能力待确认"
+      return 1
+    fi
+    sleep 10
+  done
+}
+
+step "重启旧 blue（${OLD}）—— 两次，间隔 ${REBOOT_GAP}s"
 if [ "${RESTART_OLD}" != "true" ]; then
   warn "--skip-restart-old：跳过。DNS 缓存未过期的客户端可能仍在旧实例上读写（数据分叉风险）"
 else
-  OLD_ST=$(rds_q "${OLD}" DBInstanceStatus)
-  if [ -z "${OLD_ST}" ] || [ "${OLD_ST}" = "None" ]; then
-    warn "找不到实例 ${OLD}，跳过重启。请人工确认旧 blue 的实际名字"
-  elif [ "${OLD_ST}" != "available" ]; then
-    warn "${OLD} 当前状态 ${OLD_ST}（非 available），跳过重启以免叠加操作。可稍后手工执行："
-    log "     aws rds reboot-db-instance --db-instance-identifier ${OLD}"
-  else
-    OUT=$(aws rds reboot-db-instance --db-instance-identifier "${OLD}" \
-            --query 'DBInstance.DBInstanceStatus' --output text 2>&1) || {
-      log "${OUT}"
-      warn "重启下发失败。残留连接可能还在旧实例上，请人工重启：aws rds reboot-db-instance --db-instance-identifier ${OLD}"
-      OUT=""
-    }
-    if [ -n "${OUT}" ]; then
-      ok "已下发重启，状态=${OUT}"
-      R0=$(date -u +%s)
-      # 只等回到 available，不做失败判定 —— 旧实例已不在服务路径上，
-      # 它起不来只影响回滚能力，不影响当前业务，交给人判断。
-      while :; do
-        OLD_ST=$(rds_q "${OLD}" DBInstanceStatus)
-        NOW=$(date -u +%s)
-        printf '  %s  %s=%s  (%ds)\n' "$(date -u '+%H:%M:%S')" "${OLD}" "${OLD_ST}" "$((NOW-R0))"
-        [ "${OLD_ST}" = "available" ] && [ $((NOW-R0)) -gt 20 ] && { ok "${OLD} 已回到 available，回滚资产完好"; break; }
-        if [ $((NOW-R0)) -gt 600 ]; then
-          warn "${OLD} 600s 内未回到 available（当前 ${OLD_ST}）。不影响当前业务，但回滚能力待确认"
-          break
-        fi
-        sleep 10
-      done
-      state_set "${INST}" OLD_REBOOTED_AT "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-    fi
+  if reboot_old 1; then
+    log ""
+    info "等待 ${REBOOT_GAP}s 后再重启一次（给残留客户端一个重连的机会，然后掐断它）"
+    sleep "${REBOOT_GAP}"
+    log ""
+    reboot_old 2 || true
   fi
+  log ""
+  info "等待 ${OLD} 回到 available"
+  wait_old_available || true
 fi
 
 # ---------- 切换后自查清单 ----------

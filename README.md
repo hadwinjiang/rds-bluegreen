@@ -36,6 +36,51 @@ watch -n 60 "./02-gate.sh $INST"
 ./04-cleanup-old.sh $INST --apply
 ```
 
+## 多实例批量
+
+`01-prepare.sh` 不交互、不读 stdin、状态各自写 `<instance>.env`，所以多个实例直接并发跑即可，
+不需要额外的批处理脚本：
+
+```bash
+export AWS_DEFAULT_REGION=us-west-2
+mkdir -p logs
+
+for i in db-a db-b db-c; do
+  nohup ./01-prepare.sh "$i" 8.4.11 --apply > "logs/$i.log" 2>&1 &
+  disown
+done
+```
+
+查看进度：
+
+```bash
+tail -f logs/db-a.log             # 跟单个
+grep -h '结论：' logs/*.log        # 全部结论
+grep -l '结论：NO-GO' logs/*.log   # 哪些预检没过
+```
+
+注意事项：
+
+| 项 | 说明 |
+|---|---|
+| **`2>&1` 必须有** | `die` 走 stderr，漏了它预检失败的原因就丢了 |
+| **每个实例一份日志** | 共用一个文件时并发输出会交错，事后读不出来 |
+| **先 dry-run 一遍** | 去掉 `--apply` 跑完确认 9 项预检与参数组决策，再加 `--apply` |
+| **并发数 4–6** | `CreateBlueGreenDeployment` 和 `describe-*` 有 API 限流，同账号同时建太多套还会互抢快照与存储配额。跑完一批再下一批 |
+| **`disown`** | `nohup` 只挡 SIGHUP；zsh 关窗口时可能直接杀进程组 |
+| **关掉睡眠** | 01 要跑 1–4 小时，笔记本休眠期间 AWS API 调用会断。`caffeinate -d` 开着 |
+
+日志里不会有颜色乱码 —— `_common.sh` 的 `[ -t 1 ] ||` 在非终端时自动关掉了 ANSI 码。
+
+### 哪些阶段不要批量
+
+| 阶段 | 批量 | 理由 |
+|---|---|---|
+| `01-prepare` | **可以并发** | 对业务零影响，单实例 1–4 小时，串行不可接受 |
+| `02-gate` | **可以轮询** | 只读。多实例可以 `for i in ...; do ./02-gate.sh $i; done` 定时跑，看谁到了 GO |
+| `03-switchover` | **不要并发** | 这是唯一有业务影响的时刻。并发切换意味着多个业务同时进入 DNS 窗口，出问题无法分辨影响面。按清单串行执行，每个单独确认 |
+| `04-cleanup-old` | **不要** | 删掉的是唯一回滚资产，刻意不进流水线（见下文「已知限制」） |
+
 ## 脚本说明
 
 | 脚本 | 读/写 | 作用 |
@@ -43,7 +88,7 @@ watch -n 60 "./02-gate.sh $INST"
 | `_common.sh` | — | 公共库：日志、状态文件、dry-run 包装 |
 | `01-prepare.sh` | **写** | 9 项预检 + 创建蓝绿。预检 NO-GO 则拒绝创建。`--target-class` / `--target-pg` / `--auto-target-pg` 可选 |
 | `02-gate.sh` | 只读 | 七项切换闸门 |
-| `03-switchover.sh` | **写** | 先调 `02`，不过则拒绝；超时被取消会当失败处理。切换成功后重启旧 blue（`-old1`）断开残留连接，再打印自查清单与回滚步骤 |
+| `03-switchover.sh` | **写** | 先调 `02`，不过则拒绝；超时被取消会当失败处理。切换成功后重启旧 blue（`-old1`）两次、间隔 60s（`--reboot-gap`），断开残留连接及「断了又连回来」的客户端，再打印自查清单与回滚步骤（`--skip-restart-old` 可关掉）|
 | `04-cleanup-old.sh` | **写** | 删除 `-old1` 与蓝绿记录 |
 
 ### `01-prepare.sh` 的 9 项预检
